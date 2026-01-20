@@ -1,4 +1,9 @@
-
+from langchain_core.messages import AIMessage
+from typing import TypedDict, List, Dict, Any
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langchain_core.tools import tool
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 import json, os, re
@@ -17,7 +22,16 @@ REPLIES = load("replies.json")
 
 class TriageInput(BaseModel):
     ticket_text: str
-    order_id: str | None = None
+    order_id: Optional[str] = None
+class TriageState(TypedDict, total=False):
+    messages: List[Dict[str, str]]
+    ticket_text: str
+    order_id: Optional[str]
+    issue_type: str
+    evidence: str
+    recommendation: str
+    order: Dict[str, Any]
+    reply_text: str
 
 @app.get("/health")
 def health(): return {"status": "ok"}
@@ -29,7 +43,7 @@ def orders_get(order_id: str = Query(...)):
     raise HTTPException(status_code=404, detail="Order not found")
 
 @app.get("/orders/search")
-def orders_search(customer_email: str | None = None, q: str | None = None):
+def orders_search(customer_email: Optional[str] = None, q: Optional[str] = None):
     matches = []
     for o in ORDERS:
         if customer_email and o["email"].lower() == customer_email.lower():
@@ -46,7 +60,7 @@ def classify_issue(payload: dict):
             return {"issue_type": rule["issue_type"], "confidence": 0.85}
     return {"issue_type": "unknown", "confidence": 0.1}
 
-def render_reply(issue_type: str, order):
+def render_reply(issue_type: str, order: dict):
     template = next((r["template"] for r in REPLIES if r["issue_type"] == issue_type), None)
     if not template: template = "Hi {{customer_name}}, we are reviewing order {{order_id}}."
     return template.replace("{{customer_name}}", order.get("customer_name","Customer")).replace("{{order_id}}", order.get("order_id",""))
@@ -55,16 +69,153 @@ def render_reply(issue_type: str, order):
 def reply_draft(payload: dict):
     return {"reply_text": render_reply(payload.get("issue_type"), payload.get("order", {}))}
 
-@app.post("/triage/invoke")
-def triage_invoke(body: TriageInput):
-    text = body.ticket_text
-    order_id = body.order_id
+def ingest_node(state: TriageState) -> TriageState:
+    text = state.get("ticket_text", "")
+    order_id = state.get("order_id")
+
+    messages = state.get("messages") or []
+    if not messages:
+        messages = [{"role": "customer", "content": text}]
+
     if not order_id:
         m = re.search(r"(ORD\d{4})", text, re.IGNORECASE)
-        if m: order_id = m.group(1).upper()
-    if not order_id: raise HTTPException(status_code=400, detail="order_id missing and not found in text")
+        if m:
+            order_id = m.group(1).upper()
+
+    return {**state, "messages": messages, "ticket_text": text, "order_id": order_id}
+
+
+def classify_issue_node(state: TriageState) -> TriageState:
+    text = (state.get("ticket_text") or "").lower()
+
+    issue_type = "unknown"
+    evidence = "No keyword matched."
+    recommendation = "Ask for more details or escalate."
+
+    for rule in ISSUES:
+        if rule["keyword"] in text:
+            issue_type = rule["issue_type"]
+            evidence = f"Matched keyword: {rule['keyword']}"
+            recommendation = f"Handle as {issue_type}."
+            break
+
+    messages = state.get("messages") or []
+    messages.append(
+        {"role": "assistant", "content": f"I think this is '{issue_type}'. Evidence: {evidence}. Recommendation: {recommendation}"}
+    )
+    messages.append({"role": "admin", "content": "approved"})
+
+    return {**state, "messages": messages, "issue_type": issue_type, "evidence": evidence, "recommendation": recommendation}
+
+
+@tool
+def fetch_order_tool(order_id: str) -> Dict[str, Any]:
+    """Fetch a fake order by order_id from mock_data/orders.json."""
     order = next((o for o in ORDERS if o["order_id"] == order_id), None)
-    if not order: raise HTTPException(status_code=404, detail="order not found")
-    issue = classify_issue({"ticket_text": text})
-    reply = reply_draft({"ticket_text": text, "order": order, "issue_type": issue["issue_type"]})
-    return {"order_id": order_id, "issue_type": issue["issue_type"], "order": order, "reply_text": reply["reply_text"]}
+    if not order:
+        raise ValueError("order not found")
+    return order
+
+def make_fetch_order_tool_call_node(state: TriageState) -> TriageState:
+    order_id = state.get("order_id")
+    if not order_id:
+        return state
+
+    tool_call_msg = AIMessage(
+        content="",
+        tool_calls=[{"name": "fetch_order_tool", "args": {"order_id": order_id}, "id": "call_fetch_order_1"}],
+    )
+
+    return {**state, "messages": (state.get("messages") or []) + [tool_call_msg]}
+
+
+def draft_reply_node(state: TriageState) -> TriageState:
+    order = state.get("order") or {}
+    issue_type = state.get("issue_type") or "unknown"
+    reply_text = render_reply(issue_type, order)
+
+    messages = state.get("messages") or []
+    messages.append({"role": "assistant", "content": reply_text})
+
+    return {**state, "reply_text": reply_text, "messages": messages}
+
+def store_order_from_tool_result_node(state: TriageState) -> TriageState:
+    messages = state.get("messages") or []
+    last = messages[-1] if messages else None
+
+    order = None
+    if last and hasattr(last, "content"):
+        order = last.content
+
+    if isinstance(order, str):
+        try:
+            order = json.loads(order)
+        except Exception:
+            pass
+
+    if isinstance(order, dict):
+        return {**state, "order": order}
+
+    return state
+
+
+tool_node = ToolNode([fetch_order_tool])
+
+graph = StateGraph(TriageState)
+graph.add_node("ingest", ingest_node)
+graph.add_node("classify_issue", classify_issue_node)
+graph.add_node("make_fetch_order_tool_call", make_fetch_order_tool_call_node)
+graph.add_node("fetch_order", tool_node)
+graph.add_node("store_order", store_order_from_tool_result_node)
+graph.add_node("draft_reply", draft_reply_node)
+
+graph.set_entry_point("ingest")
+graph.add_edge("ingest", "classify_issue")
+
+
+def route_after_classify(state: TriageState) -> str:
+    if not state.get("order_id"):
+        return END
+    return "make_fetch_order_tool_call"
+
+
+graph.add_conditional_edges(
+    "classify_issue",
+    route_after_classify,
+    {"make_fetch_order_tool_call": "make_fetch_order_tool_call", END: END},
+)
+
+graph.add_edge("make_fetch_order_tool_call", "fetch_order")
+graph.add_edge("fetch_order", "store_order")
+graph.add_edge("store_order", "draft_reply")
+graph.add_edge("draft_reply", END)
+
+triage_graph = graph.compile()
+
+
+
+@app.post("/triage/invoke")
+def triage_invoke(body: TriageInput):
+    init_state: TriageState = {
+        "ticket_text": body.ticket_text,
+        "order_id": body.order_id,
+        "messages": [{"role": "customer", "content": body.ticket_text}],
+    }
+
+    result = triage_graph.invoke(init_state)
+
+    if not result.get("order_id"):
+        raise HTTPException(status_code=400, detail="order_id missing and not found in text")
+
+    if "order" not in result:
+        raise HTTPException(status_code=404, detail="order not found")
+
+    return {
+        "order_id": result.get("order_id"),
+        "issue_type": result.get("issue_type"),
+        "evidence": result.get("evidence"),
+        "recommendation": result.get("recommendation"),
+        "order": result.get("order"),
+        "reply_text": result.get("reply_text"),
+        "messages": result.get("messages"),
+    }
