@@ -1,0 +1,2 @@
+For the coding copilot, I have used Cursor to improve the speed of implementing and also debugging. It has helped me a lot to navigate the starter repo, set up the LangGraph state and also node wiring (ingest – classify – fetch order ToolNode – draft reply) and work on handling the errors to reach the expectations. I have validated the final output by using the FastAPi server locally, testing /triage/invoke by sample requests, and making sure all pytest tests pass locally as well as in GitHub Actions CI.
+
