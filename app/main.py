@@ -196,16 +196,24 @@ triage_graph = graph.compile()
 
 @app.post("/triage/invoke")
 def triage_invoke(body: TriageInput):
+    # If order_id not provided, try extracting from text
+    order_id = body.order_id
+    if not order_id:
+        m = re.search(r"(ORD\d{4})", body.ticket_text or "", re.IGNORECASE)
+        if m:
+            order_id = m.group(1).upper()
+
+    # ✅ REQUIRED by tests: if still missing, return 400
+    if not order_id:
+        raise HTTPException(status_code=400, detail="order_id missing and not found in text")
+
     init_state: TriageState = {
         "ticket_text": body.ticket_text,
-        "order_id": body.order_id,
+        "order_id": order_id,
         "messages": [{"role": "customer", "content": body.ticket_text}],
     }
 
     result = triage_graph.invoke(init_state)
-
-    if not result.get("order_id"):
-        raise HTTPException(status_code=400, detail="order_id missing and not found in text")
 
     if "order" not in result:
         raise HTTPException(status_code=404, detail="order not found")
